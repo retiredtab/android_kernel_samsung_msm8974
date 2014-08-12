@@ -164,7 +164,7 @@ static int sec_fg_get_property(struct power_supply *psy,
 					__func__, val->intval);
 			}
 		} else {
-			dev_err(&fuelgauge->client->dev, "%s: bat irq gpio is invalid (%d)\n",
+			WARN_ONCE(1, "%s: bat irq gpio is invalid (%d)\n",
 				__func__, fuelgauge->pdata->bat_irq_gpio);
 			val->intval = 1;
 		}
