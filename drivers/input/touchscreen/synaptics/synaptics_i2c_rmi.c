@@ -63,6 +63,8 @@ struct qpnp_pin_cfg synaptics_int_set[] = {
 	},
 };
 
+extern bool tsp_keys_enabled;
+
 struct list_head exp_fn_list;
 
 void synaptics_power_ctrl(struct synaptics_rmi4_data *rmi4_data, bool enable);
@@ -1855,6 +1857,7 @@ static void synaptics_rmi4_f1a_report(struct synaptics_rmi4_data *rmi4_data,
 
 	data = f1a->button_data_buffer;
 
+	if (tsp_keys_enabled) {
 	for (button = 0; button < f1a->valid_button_count; button++) {
 		index = button / 8;
 		shift = button % 8;
@@ -1906,6 +1909,7 @@ static void synaptics_rmi4_f1a_report(struct synaptics_rmi4_data *rmi4_data,
 				f1a->button_map[button],
 				status);
 #endif
+	}
 	}
 
 #ifdef TKEY_BOOSTER

@@ -1099,6 +1099,31 @@ static struct attribute *cmd_attributes[] = {
 	NULL,
 };
 
+bool tsp_keys_enabled = true;
+
+static ssize_t synaptics_rmi4_show_tsp_keys_enabled(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%u\n", tsp_keys_enabled);
+}
+
+static ssize_t synaptics_rmi4_tsp_keys_enabled_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int input;
+
+	if (sscanf(buf, "%u", &input) != 1)
+		return -EINVAL;
+
+	tsp_keys_enabled = (input != 0);
+
+	return count;
+}
+
+static DEVICE_ATTR(tsp_keys_enabled, S_IRUGO | S_IWUSR | S_IWGRP,
+			synaptics_rmi4_show_tsp_keys_enabled,
+			synaptics_rmi4_tsp_keys_enabled_store);
+
 #ifdef TOUCHKEY_ENABLE
 static struct attribute *tskey_attributes[] = {
 	&dev_attr_touchkey_threshold.attr,
@@ -1112,6 +1137,7 @@ static struct attribute *tskey_attributes[] = {
 #ifdef TKEY_BOOSTER
 	&dev_attr_boost_level.attr,
 #endif
+	&dev_attr_tsp_keys_enabled.attr,
 	NULL,
 };
 
