@@ -330,7 +330,7 @@ static struct of_device_id msm_pm_match_table[] = {
 	{},
 };
 
-static struct platform_driver msm_pm_boot_driver = {
+static struct platform_driver msm_pm_boot_driver __refdata = {
 	.probe = msm_pm_boot_probe,
 	.driver = {
 		.name = "pm-boot",
