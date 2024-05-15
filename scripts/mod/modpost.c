@@ -15,6 +15,8 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <string.h>
+#include <limits.h>
+#include <stdbool.h>
 #include "modpost.h"
 #include "../../include/generated/autoconf.h"
 #include "../../include/linux/license.h"
@@ -87,6 +89,14 @@ PRINTF void merror(const char *fmt, ...)
 	va_end(arglist);
 }
 
+static inline bool strends(const char *str, const char *postfix)
+{
+	if (strlen(str) < strlen(postfix))
+		return false;
+
+	return strcmp(str + strlen(str) - strlen(postfix), postfix) == 0;
+}
+
 static int is_vmlinux(const char *modname)
 {
 	const char *myname;
@@ -122,22 +132,20 @@ static struct module *find_module(char *modname)
 	return mod;
 }
 
-static struct module *new_module(char *modname)
+static struct module *new_module(const char *modname)
 {
 	struct module *mod;
-	char *p, *s;
+	char *p;
 
 	mod = NOFAIL(malloc(sizeof(*mod)));
 	memset(mod, 0, sizeof(*mod));
 	p = NOFAIL(strdup(modname));
 
 	/* strip trailing .o */
-	s = strrchr(p, '.');
-	if (s != NULL)
-		if (strcmp(s, ".o") == 0) {
-			*s = '\0';
-			mod->is_dot_o = 1;
-		}
+	if (strends(p, ".o")) {
+		p[strlen(p) - 2] = '\0';
+		mod->is_dot_o = 1;
+	}
 
 	/* add to list */
 	mod->name = p;
@@ -162,7 +170,7 @@ struct symbol {
 	unsigned int vmlinux:1;    /* 1 if symbol is defined in vmlinux */
 	unsigned int kernel:1;     /* 1 if symbol is from kernel
 				    *  (only for external modules) **/
-	unsigned int preloaded:1;  /* 1 if symbol from Module.symvers */
+	unsigned int preloaded:1;  /* 1 if symbol from Module.symvers, or crc */
 	enum export  export;       /* Type of export */
 	char name[0];
 };
@@ -314,7 +322,7 @@ static struct symbol *sym_add_exported(const char *name, struct module *mod,
 			     s->module->name,
 			     is_vmlinux(s->module->name) ?"":".ko");
 		} else {
-			/* In case Modules.symvers was out of date */
+			/* In case Module.symvers was out of date */
 			s->module = mod;
 		}
 	}
@@ -330,8 +338,11 @@ static void sym_update_crc(const char *name, struct module *mod,
 {
 	struct symbol *s = find_symbol(name);
 
-	if (!s)
+	if (!s) {
 		s = new_symbol(name, mod, export);
+		/* Don't complain when we find it later. */
+		s->preloaded = 1;
+	}
 	s->crc = crc;
 	s->crc_valid = 1;
 }
@@ -339,17 +350,20 @@ static void sym_update_crc(const char *name, struct module *mod,
 void *grab_file(const char *filename, unsigned long *size)
 {
 	struct stat st;
-	void *map;
+	void *map = MAP_FAILED;
 	int fd;
 
 	fd = open(filename, O_RDONLY);
-	if (fd < 0 || fstat(fd, &st) != 0)
+	if (fd < 0)
 		return NULL;
+	if (fstat(fd, &st))
+		goto failed;
 
 	*size = st.st_size;
 	map = mmap(NULL, *size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-	close(fd);
 
+failed:
+	close(fd);
 	if (map == MAP_FAILED)
 		return NULL;
 	return map;
@@ -601,17 +615,16 @@ static void handle_modversions(struct module *mod, struct elf_info *info,
 	else
 		export = export_from_sec(info, get_secindex(info, sym));
 
+	/* CRC'd symbol */
+	if (strncmp(symname, CRC_PFX, strlen(CRC_PFX)) == 0) {
+		crc = (unsigned int) sym->st_value;
+		sym_update_crc(symname + strlen(CRC_PFX), mod, crc,
+				export);
+	}
+
 	switch (sym->st_shndx) {
 	case SHN_COMMON:
 		warn("\"%s\" [%s] is COMMON symbol\n", symname, mod->name);
-		break;
-	case SHN_ABS:
-		/* CRC'd symbol */
-		if (strncmp(symname, CRC_PFX, strlen(CRC_PFX)) == 0) {
-			crc = (unsigned int) sym->st_value;
-			sym_update_crc(symname + strlen(CRC_PFX), mod, crc,
-					export);
-		}
 		break;
 	case SHN_UNDEF:
 		/* undefined symbol */
@@ -822,14 +835,20 @@ static const char *section_white_list[] =
 {
 	".comment*",
 	".debug*",
+	".cranges",		/* sh64 */
 	".zdebug*",		/* Compressed debug sections. */
 	".GCC-command-line",	/* mn10300 */
+	".GCC.command.line",	/* record-gcc-switches, non mn10300 */
 	".mdebug*",        /* alpha, score, mips etc. */
 	".pdr",            /* alpha, score, mips etc. */
 	".stab*",
 	".note*",
 	".got*",
 	".toc*",
+	".xt.prop",				 /* xtensa */
+	".xt.lit",         /* xtensa */
+	".arcextmap*",			/* arc */
+	".gnu.linkonce.arcext*",	/* arc : modules */
 	NULL
 };
 
@@ -839,7 +858,7 @@ static const char *section_white_list[] =
  * without "ax" / "aw".
  */
 static void check_section(const char *modname, struct elf_info *elf,
-                          Elf_Shdr *sechdr)
+			  Elf_Shdr *sechdr)
 {
 	const char *sec = sech_name(elf, sechdr);
 
@@ -868,6 +887,11 @@ static void check_section(const char *modname, struct elf_info *elf,
 #define ALL_EXIT_TEXT_SECTIONS \
 	".exit.text$", ".devexit.text$", ".cpuexit.text$", ".memexit.text$"
 
+#define ALL_PCI_INIT_SECTIONS	\
+	".pci_fixup_early$", ".pci_fixup_header$", ".pci_fixup_final$", \
+	".pci_fixup_enable$", ".pci_fixup_resume$", \
+	".pci_fixup_resume_early$", ".pci_fixup_suspend$"
+
 #define ALL_XXXINIT_SECTIONS DEV_INIT_SECTIONS, CPU_INIT_SECTIONS, \
 	MEM_INIT_SECTIONS
 #define ALL_XXXEXIT_SECTIONS DEV_EXIT_SECTIONS, CPU_EXIT_SECTIONS, \
@@ -877,7 +901,7 @@ static void check_section(const char *modname, struct elf_info *elf,
 #define ALL_EXIT_SECTIONS EXIT_SECTIONS, ALL_XXXEXIT_SECTIONS
 
 #define DATA_SECTIONS ".data$", ".data.rel$"
-#define TEXT_SECTIONS ".text$"
+#define TEXT_SECTIONS ".text$", ".text.unlikely$"
 
 #define INIT_SECTIONS      ".init.*"
 #define DEV_INIT_SECTIONS  ".devinit.*"
@@ -1030,6 +1054,12 @@ const struct sectioncheck sectioncheck[] = {
 	.mismatch = ANY_EXIT_TO_ANY_INIT,
 	.symbol_white_list = { DEFAULT_SYMBOL_WHITE_LIST, NULL },
 },
+{
+	.fromsec = { ALL_PCI_INIT_SECTIONS, NULL },
+	.tosec   = { INIT_SECTIONS, NULL },
+	.mismatch = ANY_INIT_TO_ANY_EXIT,
+	.symbol_white_list = { NULL },
+},
 /* Do not export init/exit functions or data */
 {
 	.fromsec = { "__ksymtab*", NULL },
@@ -1098,6 +1128,14 @@ static const struct sectioncheck *section_mismatch(
  *   This pattern is identified by
  *   refsymname = __init_begin, _sinittext, _einittext
  *
+ * Pattern 6:
+ *   Hide section mismatch warnings for ELF local symbols.  The goal
+ *   is to eliminate false positive modpost warnings caused by
+ *   compiler-generated ELF local symbol names such as ".LANCHOR1".
+ *   Autogenerated symbol names bypass modpost's "Pattern 2"
+ *   whitelisting, which relies on pattern-matching against symbol
+ *   names to work.  (One situation where gcc can autogenerate ELF
+ *   local symbols is when "-fsection-anchors" is used.)
  **/
 static int secref_whitelist(const struct sectioncheck *mismatch,
 			    const char *fromsec, const char *fromsym,
@@ -1128,6 +1166,10 @@ static int secref_whitelist(const struct sectioncheck *mismatch,
 
 	/* Check for pattern 4 */
 	if (match(tosym, linker_symbols))
+		return 0;
+
+	/* Check for pattern 6 */
+	if (strstarts(fromsym, ".L"))
 		return 0;
 
 	return 1;
@@ -1293,6 +1335,15 @@ static void print_section_list(const char * const list[20])
 	fprintf(stderr, "\n");
 }
 
+static inline void get_pretty_name(int is_func, const char** name, const char** name_p)
+{
+	switch (is_func) {
+	case 0:	*name = "variable"; *name_p = ""; break;
+	case 1:	*name = "function"; *name_p = "()"; break;
+	default: *name = "(unknown reference)"; *name_p = ""; break;
+	}
+}
+
 /*
  * Print a warning about a section mismatch.
  * Try to find symbols near it so user can find it.
@@ -1300,32 +1351,24 @@ static void print_section_list(const char * const list[20])
  */
 static void report_sec_mismatch(const char *modname,
 				const struct sectioncheck *mismatch,
-                                const char *fromsec,
-                                unsigned long long fromaddr,
-                                const char *fromsym,
-                                int from_is_func,
-                                const char *tosec, const char *tosym,
-                                int to_is_func)
+				const char *fromsec,
+				unsigned long long fromaddr,
+				const char *fromsym,
+				int from_is_func,
+				const char *tosec, const char *tosym,
+				int to_is_func)
 {
 	const char *from, *from_p;
 	const char *to, *to_p;
 	char *prl_from;
 	char *prl_to;
 
-	switch (from_is_func) {
-	case 0: from = "variable"; from_p = "";   break;
-	case 1: from = "function"; from_p = "()"; break;
-	default: from = "(unknown reference)"; from_p = ""; break;
-	}
-	switch (to_is_func) {
-	case 0: to = "variable"; to_p = "";   break;
-	case 1: to = "function"; to_p = "()"; break;
-	default: to = "(unknown reference)"; to_p = ""; break;
-	}
-
 	sec_mismatch_count++;
 	if (!sec_mismatch_verbose)
 		return;
+
+	get_pretty_name(from_is_func, &from, &from_p);
+	get_pretty_name(to_is_func, &to, &to_p);
 
 	warn("%s(%s+0x%llx): Section mismatch in reference from the %s %s%s "
 	     "to the %s %s:%s%s\n",
@@ -1445,7 +1488,7 @@ static void report_sec_mismatch(const char *modname,
 }
 
 static void check_section_mismatch(const char *modname, struct elf_info *elf,
-                                   Elf_Rela *r, Elf_Sym *sym, const char *fromsec)
+				   Elf_Rela *r, Elf_Sym *sym, const char *fromsec)
 {
 	const char *tosec;
 	const struct sectioncheck *mismatch;
@@ -1518,15 +1561,15 @@ static int addend_arm_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 	case R_ARM_ABS32:
 		/* From ARM ABI: (S + A) | T */
 		r->r_addend = (int)(long)
-		              (elf->symtab_start + ELF_R_SYM(r->r_info));
+			      (elf->symtab_start + ELF_R_SYM(r->r_info));
 		break;
 	case R_ARM_PC24:
 	case R_ARM_CALL:
 	case R_ARM_JUMP24:
 		/* From ARM ABI: ((S + A) | T) - P */
 		r->r_addend = (int)(long)(elf->hdr +
-		              sechdr->sh_offset +
-		              (r->r_offset - sechdr->sh_addr));
+			      sechdr->sh_offset +
+			      (r->r_offset - sechdr->sh_addr));
 		break;
 	default:
 		return 1;
@@ -1558,7 +1601,7 @@ static int addend_mips_rel(struct elf_info *elf, Elf_Shdr *sechdr, Elf_Rela *r)
 }
 
 static void section_rela(const char *modname, struct elf_info *elf,
-                         Elf_Shdr *sechdr)
+			 Elf_Shdr *sechdr)
 {
 	Elf_Sym  *sym;
 	Elf_Rela *rela;
@@ -1602,7 +1645,7 @@ static void section_rela(const char *modname, struct elf_info *elf,
 }
 
 static void section_rel(const char *modname, struct elf_info *elf,
-                        Elf_Shdr *sechdr)
+			Elf_Shdr *sechdr)
 {
 	Elf_Sym *sym;
 	Elf_Rel *rel;
@@ -1672,7 +1715,7 @@ static void section_rel(const char *modname, struct elf_info *elf,
  * be discarded and warns about it.
  **/
 static void check_sec_ref(struct module *mod, const char *modname,
-                          struct elf_info *elf)
+			  struct elf_info *elf)
 {
 	int i;
 	Elf_Shdr *sechdrs = elf->sechdrs;
@@ -1751,6 +1794,27 @@ static void read_symbols(char *modname)
 	 * important anyhow */
 	if (modversions)
 		mod->unres = alloc_symbol("module_layout", 0, mod->unres);
+}
+
+static void read_symbols_from_files(const char *filename)
+{
+	FILE *in = stdin;
+	char fname[PATH_MAX];
+
+	if (strcmp(filename, "-") != 0) {
+		in = fopen(filename, "r");
+		if (!in)
+			fatal("Can't open filenames file %s: %m", filename);
+	}
+
+	while (fgets(fname, PATH_MAX, in) != NULL) {
+		if (strends(fname, "\n"))
+			fname[strlen(fname)-1] = '\0';
+		read_symbols(fname);
+	}
+
+	if (in != stdin)
+		fclose(in);
 }
 
 #define SZ 500
@@ -1856,14 +1920,14 @@ static void add_header(struct buffer *b, struct module *mod)
 	buf_printf(b, "\n");
 	buf_printf(b, "struct module __this_module\n");
 	buf_printf(b, "__attribute__((section(\".gnu.linkonce.this_module\"))) = {\n");
-	buf_printf(b, " .name = KBUILD_MODNAME,\n");
+	buf_printf(b, "\t.name = KBUILD_MODNAME,\n");
 	if (mod->has_init)
-		buf_printf(b, " .init = init_module,\n");
+		buf_printf(b, "\t.init = init_module,\n");
 	if (mod->has_cleanup)
 		buf_printf(b, "#ifdef CONFIG_MODULE_UNLOAD\n"
-			      " .exit = cleanup_module,\n"
+			      "\t.exit = cleanup_module,\n"
 			      "#endif\n");
-	buf_printf(b, " .arch = MODULE_ARCH_INIT,\n");
+	buf_printf(b, "\t.arch = MODULE_ARCH_INIT,\n");
 	buf_printf(b, "};\n");
 }
 
@@ -1880,6 +1944,11 @@ static void add_staging_flag(struct buffer *b, const char *name)
 	if (strncmp(staging_dir, name, strlen(staging_dir)) == 0)
 		buf_printf(b, "\nMODULE_INFO(staging, \"Y\");\n");
 }
+
+/* In kernel, this size is defined in linux/module.h;
+ * here we use Elf_Addr instead of long for covering cross-compile
+ */
+#define MODULE_NAME_LEN (64 - sizeof(Elf_Addr))
 
 /**
  * Record CRCs for unresolved symbols
@@ -1898,7 +1967,7 @@ static int add_versions(struct buffer *b, struct module *mod)
 					     s->name, mod->name);
 				} else {
 					merror("\"%s\" [%s.ko] undefined!\n",
-					          s->name, mod->name);
+					       s->name, mod->name);
 					err = 1;
 				}
 			}
@@ -1925,7 +1994,14 @@ static int add_versions(struct buffer *b, struct module *mod)
 				s->name, mod->name);
 			continue;
 		}
-		buf_printf(b, "\t{ %#8x, \"%s\" },\n", s->crc, s->name);
+		if (strlen(s->name) >= MODULE_NAME_LEN) {
+			merror("too long symbol \"%s\" [%s.ko]\n",
+			       s->name, mod->name);
+			err = 1;
+			break;
+		}
+		buf_printf(b, "\t{ %#8x, __VMLINUX_SYMBOL_STR(%s) },\n",
+			   s->crc, s->name);
 	}
 
 	buf_printf(b, "};\n");
@@ -2065,8 +2141,10 @@ static void read_dump(const char *fname, unsigned int kernel)
 		s->preloaded = 1;
 		sym_update_crc(symname, mod, crc, export_no(export));
 	}
+	release_file(file, size);
 	return;
 fail:
+	release_file(file, size);
 	fatal("parse error in symbol dump file\n");
 }
 
@@ -2113,13 +2191,13 @@ int main(int argc, char **argv)
 	struct module *mod;
 	struct buffer buf = { };
 	char *kernel_read = NULL, *module_read = NULL;
-	char *dump_write = NULL;
+	char *dump_write = NULL, *files_source = NULL;
 	int opt;
 	int err;
 	struct ext_sym_list *extsym_iter;
 	struct ext_sym_list *extsym_start = NULL;
 
-	while ((opt = getopt(argc, argv, "i:I:e:msSo:awM:K:E")) != -1) {
+	while ((opt = getopt(argc, argv, "i:I:e:msST:o:awM:K:E")) != -1) {
 		switch (opt) {
 		case 'i':
 			kernel_read = optarg;
@@ -2151,6 +2229,9 @@ int main(int argc, char **argv)
 		case 'S':
 			sec_mismatch_verbose = 0;
 			break;
+		case 'T':
+			files_source = optarg;
+			break;
 		case 'w':
 			warn_unresolved = 1;
 			break;
@@ -2175,6 +2256,9 @@ int main(int argc, char **argv)
 
 	while (optind < argc)
 		read_symbols(argv[optind++]);
+
+	if (files_source)
+		read_symbols_from_files(files_source);
 
 	for (mod = modules; mod; mod = mod->next) {
 		if (mod->skip)
