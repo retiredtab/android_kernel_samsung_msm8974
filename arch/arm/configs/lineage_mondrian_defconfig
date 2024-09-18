@@ -90,7 +90,15 @@ CONFIG_RCU_FAST_NO_HZ=y
 CONFIG_RCU_BOOST=y
 CONFIG_RCU_BOOST_PRIO=1
 CONFIG_RCU_BOOST_DELAY=500
-# CONFIG_IKCONFIG is not set
+
+# needed for
+# system_server: Could not open /proc/config.gz
+# signal 6 (SIGABRT), code -1 (SI_QUEUE), fault addr --------
+# Abort message: 'Check failed: result == OK Kernel configs could not be fetched. b/151092221'
+
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+
 CONFIG_LOG_BUF_SHIFT=18
 CONFIG_GENERIC_SCHED_CLOCK=y
 CONFIG_CGROUPS=y
